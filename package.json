@@ -4,6 +4,9 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Standalone daemon for controlling Pi sessions through the Codex app-server protocol.",
+  "bin": {
+    "pi-remote-daemon": "bin/pi-remote-daemon"
+  },
   "scripts": {
     "start": "node src/main.mjs",
     "check": "node --check src/main.mjs && node --check test/protocol.test.mjs",

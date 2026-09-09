@@ -9,6 +9,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
+import { selectModelCandidate } from "./model-resolution.mjs";
+import { toolItemFromCall } from "./tool-items.mjs";
 import {
 	createAgentSession,
 	ModelRuntime,
@@ -35,28 +37,10 @@ const REMOTE_OUTBOUND_MAX_BYTES = 16 * 1024 * 1024;
 const REMOTE_CHUNK_BUFFER_MAX_BYTES = 128 * 1024 * 1024;
 
 function parseArgs(argv) {
-	const options = { command: "start", socket: defaultSocket, host: "127.0.0.1" };
-	let index = 0;
-	if (argv[0] && !argv[0].startsWith("-")) options.command = argv[index++];
-	while (index < argv.length) {
-		const arg = argv[index++];
-		switch (arg) {
-			case "--socket": options.socket = resolve(argv[index++]); break;
-			case "--host": options.host = argv[index++]; break;
-			case "--port": options.port = Number(argv[index++]); break;
-			case "--session": options.session = resolve(argv[index++]); break;
-			case "--pid": options.pid = Number(argv[index++]); break;
-			case "--force": options.force = true; break;
-			case "--remote": options.remote = true; break;
-			case "--models": options.models = String(argv[index++] || "").split(",").map((pattern) => pattern.trim()).filter(Boolean); break;
-			case "--remote-url": options.remoteUrl = argv[index++]; break;
-			case "--wait": options.wait = true; break;
-			case "--re-enroll": options.reEnroll = true; break;
-			case "--help": options.help = true; break;
-			default: throw new Error(`Unknown option: ${arg}`);
-		}
+	if (argv.length !== 1 || !["pair", "start"].includes(argv[0])) {
+		throw new Error("Usage: pi-remote-daemon <pair|start>");
 	}
-	return options;
+	return { command: argv[0], socket: defaultSocket, remote: true };
 }
 
 function shellQuote(value) {
@@ -199,6 +183,22 @@ function textFromInput(input) {
 	return (input || []).filter((part) => part?.type === "text").map((part) => part.text || "").join("\n");
 }
 
+/** Keep diagnostics useful without writing user prompts or image URLs to the daemon log. */
+function requestLogContext(params = {}) {
+	const context = {};
+	for (const key of ["threadId", "turnId", "expectedTurnId", "model", "modelProvider", "effort", "cwd", "clientUserMessageId"]) {
+		if (params[key] !== undefined && params[key] !== null) context[key] = params[key];
+	}
+	if (Array.isArray(params.input)) {
+		context.input = {
+			parts: params.input.length,
+			types: params.input.map((part) => part?.type || "unknown"),
+			textChars: params.input.reduce((total, part) => total + (part?.type === "text" ? String(part.text || "").length : 0), 0),
+		};
+	}
+	return context;
+}
+
 function timestampSeconds(value, fallback = Date.now()) {
 	const timestamp = typeof value === "number" ? value : Date.parse(value || "");
 	return Math.floor((Number.isFinite(timestamp) ? timestamp : fallback) / 1000);
@@ -221,30 +221,6 @@ function userInputsFromContent(content) {
 		const mimeType = part.mimeType || part.source?.mediaType;
 		return data && mimeType ? [{ type: "image", url: `data:${mimeType};base64,${data}` }] : [];
 	});
-}
-
-function dynamicToolItem(id, tool, args, status = "inProgress") {
-	return { type: "dynamicToolCall", id, namespace: null, tool, arguments: args || {}, status, contentItems: null, success: null, durationMs: null };
-}
-
-function fileChangeItem(id, tool, args, cwd, status = "inProgress") {
-	const path = args?.path ? resolve(cwd, args.path) : cwd;
-	const kind = tool === "write" && !existsSync(path) ? { type: "add" } : { type: "update", movePath: null };
-	return { type: "fileChange", id, changes: [{ path, kind, diff: "" }], status };
-}
-
-function commandExecutionItem(id, tool, args, cwd, status = "inProgress") {
-	return {
-		type: "commandExecution", id, pluginId: null, scriptPath: null,
-		command: args?.command || tool, cwd, processId: null, source: "agent", status,
-		commandActions: [], aggregatedOutput: null, exitCode: null, durationMs: null,
-	};
-}
-
-function toolItemFromCall(id, tool, args, cwd, status = "inProgress") {
-	if (tool === "bash" || tool === "powershell") return commandExecutionItem(id, tool, args, cwd, status);
-	if (tool === "edit" || tool === "write") return fileChangeItem(id, tool, args, cwd, status);
-	return dynamicToolItem(id, tool, args, status);
 }
 
 function applyToolResult(item, message) {
@@ -336,11 +312,12 @@ function page(items, params = {}, defaultDirection = "asc") {
 }
 
 function remoteState(manager) {
-	const state = { goal: null, queue: [], turns: new Map() };
+	const state = { goal: null, queue: [], turns: new Map(), historyMode: "legacy" };
 	for (const entry of manager.getEntries()) {
 		if (entry.type !== "custom" || entry.customType !== REMOTE_METADATA_TYPE || !entry.data || typeof entry.data !== "object") continue;
 		if (entry.data.kind === "goal") state.goal = entry.data.goal || null;
 		if (entry.data.kind === "queue") state.queue = Array.isArray(entry.data.queue) ? entry.data.queue : [];
+		if (entry.data.kind === "historyMode" && ["legacy", "paginated"].includes(entry.data.historyMode)) state.historyMode = entry.data.historyMode;
 		if (entry.data.kind === "turn" && entry.data.turnId && entry.data.userEntryId) state.turns.set(entry.data.turnId, entry.data);
 	}
 	return state;
@@ -563,7 +540,12 @@ class RemoteControlClient {
 		if (this.stopped) return;
 		try {
 			await this.refreshEnrollment();
-			this.socket?.close(1000, "remote-control token refreshed");
+			// The remote-control token authenticates the WebSocket upgrade. The
+			// established relay socket remains valid after a refresh, so closing it
+			// here creates an avoidable gap and can race the relay into returning 409
+			// to the replacement connection. If the relay later closes it, the normal
+			// close handler reconnects with the refreshed token.
+			console.error("[remote] token refreshed; keeping current relay connection");
 		} catch (error) {
 			console.error(`[remote] token refresh failed: ${error.message}`);
 			this.refreshTimer = setTimeout(() => void this.refreshAndReconnect(), 30_000);
@@ -600,7 +582,7 @@ class RemoteControlClient {
 		console.log(`Host: ${pairing.environment_id}`);
 		console.log(`Expires: ${pairing.expires_at}`);
 		console.error(`[remote] pairing code issued server=${pairing.server_id} environment=${pairing.environment_id} expires=${pairing.expires_at}`);
-		if (this.options.wait) await this.waitForPairing(pairing);
+		await this.waitForPairing(pairing);
 		return pairingResponseForCodex(pairing);
 	}
 
@@ -965,6 +947,67 @@ class RemoteControlClient {
 	}
 }
 
+class TuiOwnershipBridge {
+	constructor(daemon) {
+		this.daemon = daemon;
+		this.path = join(agentDir, "app-server", "daemon-control.sock");
+		this.server = undefined;
+	}
+
+	async start() {
+		const directory = join(this.path, "..");
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		chmodSync(directory, 0o700);
+		if (existsSync(this.path)) {
+			if (await unixSocketIsLive(this.path)) throw new Error(`A daemon control bridge already owns ${this.path}`);
+			unlinkSync(this.path);
+		}
+		this.server = createNetServer((connection) => {
+			let buffer = "";
+			connection.setEncoding("utf8");
+			connection.on("data", (chunk) => {
+				buffer += chunk;
+				while (true) {
+					const newline = buffer.indexOf("\n");
+					if (newline < 0) return;
+					const line = buffer.slice(0, newline).trim();
+					buffer = buffer.slice(newline + 1);
+					void (async () => {
+						try {
+							const request = JSON.parse(line);
+							if (!request.sessionId || typeof request.sessionId !== "string") {
+								throw new Error("sessionId is required");
+							}
+							if (request.command === "claim") {
+								const released = await this.daemon.releaseSessionForTui(request.sessionId, request.pid);
+								connection.write(`${JSON.stringify({ ok: true, released })}\n`);
+							} else if (request.command === "release") {
+								this.daemon.releaseTuiOwnership(request.sessionId, request.pid);
+								connection.write('{"ok":true}\n');
+							} else {
+								throw new Error("unknown command");
+							}
+						} catch (error) {
+							connection.write(`${JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) })}\n`);
+						}
+					})();
+				}
+			});
+		});
+		await new Promise((resolvePromise, reject) => {
+			this.server.once("error", reject);
+			this.server.listen(this.path, resolvePromise);
+		});
+		chmodSync(this.path, 0o600);
+	}
+
+	async stop() {
+		if (this.server) await new Promise((resolvePromise) => this.server.close(resolvePromise));
+		this.server = undefined;
+		if (existsSync(this.path)) unlinkSync(this.path);
+	}
+}
+
 class PermissionBridge {
 	constructor(daemon) {
 		this.daemon = daemon;
@@ -1021,6 +1064,8 @@ class PiDaemon {
 		this.clients = new Set();
 		this.remoteClients = new Map();
 		this.pendingRequests = new Map();
+		this.tuiOwners = new Map();
+		this.tuiOwnershipBridge = new TuiOwnershipBridge(this);
 		this.permissionBridge = new PermissionBridge(this);
 		this.scopedModels = [];
 		this.modelRuntime = undefined;
@@ -1120,6 +1165,7 @@ class PiDaemon {
 		});
 		this.websocketServer.on("connection", (client) => this.attachClient(client));
 		await this.permissionBridge.start();
+		await this.tuiOwnershipBridge.start();
 		await new Promise((resolvePromise, reject) => {
 			this.server.once("error", reject);
 			if (this.options.port) this.server.listen(this.options.port, this.options.host, resolvePromise);
@@ -1177,10 +1223,15 @@ class PiDaemon {
 
 	async forkThread(params) {
 		if (params.lastTurnId && params.beforeTurnId) throw new Error("lastTurnId and beforeTurnId cannot be combined");
+		const requestedHistoryMode = Object.hasOwn(params, "historyMode") ? this.resolveHistoryMode(params.historyMode) : undefined;
+		if (!params.path && this.tuiOwners.has(params.threadId)) {
+			throw new Error("Thread is currently controlled by a Pi TUI");
+		}
 		const unsupported = ["serviceTier", "runtimeWorkspaceRoots", "baseInstructions", "developerInstructions", "personality"];
 		const requested = unsupported.find((field) => params[field] !== undefined && params[field] !== null && (!Array.isArray(params[field]) || params[field].length));
 		if (requested) throw new Error(`${requested} is not supported by the Pi daemon`);
-		if (params.config && Object.keys(params.config).length) throw new Error("config overrides are not supported by the Pi daemon");
+		// Mobile sends UI/config metadata with fork requests. Pi has no equivalent
+		// fork-time configuration, so preserve the source session settings and ignore it.
 		const sourceManaged = params.path
 			? [...this.sessions.values()].find((managed) => managed.session.sessionFile && resolve(managed.session.sessionFile) === resolve(params.path))
 			: this.sessions.get(params.threadId);
@@ -1223,6 +1274,7 @@ class PiDaemon {
 			scopedModels: this.scopedModels,
 			sessionManager: manager,
 		});
+		if (requestedHistoryMode) saveRemoteState(result.session.sessionManager, "historyMode", requestedHistoryMode);
 		const managed = this.registerSession(result.session, cwd);
 		if (params.model) await managed.session.setModel(this.resolveModel(params.model, params.modelProvider, managed.session.model?.provider));
 		else if (params.modelProvider) throw new Error("modelProvider requires model");
@@ -1283,8 +1335,13 @@ class PiDaemon {
 		const createdAt = Math.floor(info.created.getTime() / 1000);
 		const updatedAt = Math.floor(info.modified.getTime() / 1000);
 		let persistedContext;
+		let persistedHistoryMode = "legacy";
 		if (!managed) {
-			try { persistedContext = SessionManager.open(info.path).buildSessionContext(); } catch {}
+			try {
+				const manager = SessionManager.open(info.path);
+				persistedContext = manager.buildSessionContext();
+				persistedHistoryMode = remoteState(manager).historyMode;
+			} catch {}
 		}
 		return {
 			id: info.id,
@@ -1298,7 +1355,7 @@ class PiDaemon {
 			section: null,
 			sectionEnteredAt: null,
 			projectId: null,
-			historyMode: "legacy",
+			historyMode: managed?.historyMode || persistedHistoryMode,
 			modelProvider: managed?.session.model?.provider || persistedContext?.model?.provider || "unknown",
 			model: managed?.session.model?.id || persistedContext?.model?.modelId || null,
 			reasoningEffort: effortForCodex(managed?.session.thinkingLevel || persistedContext?.thinkingLevel) || null,
@@ -1319,6 +1376,15 @@ class PiDaemon {
 			name: info.name || managed?.session.sessionManager?.getSessionName?.() || null,
 			daybreakEnabled: null,
 			turns: [],
+		};
+	}
+
+	paginatedCursors(managed) {
+		const turns = turnsFromManager(managed.session.sessionManager);
+		const items = turns.flatMap((turn) => turn.items);
+		return {
+			turnsBackwardsCursor: turns.length ? "0" : null,
+			itemsBackwardsCursor: items.length ? "0" : null,
 		};
 	}
 
@@ -1343,7 +1409,7 @@ class PiDaemon {
 			section: null,
 			sectionEnteredAt: null,
 			projectId: null,
-			historyMode: "legacy",
+			historyMode: managed.historyMode,
 			modelProvider: managed.session.model?.provider || "unknown",
 			model: managed.session.model?.id || null,
 			reasoningEffort: effortForCodex(managed.session.thinkingLevel) || null,
@@ -1363,8 +1429,14 @@ class PiDaemon {
 			gitInfo: null,
 			name: managed.session.sessionName || null,
 			daybreakEnabled: null,
-			turns: includeTurns ? turnsFromManager(manager) : [],
+			turns: includeTurns && managed.historyMode !== "paginated" ? turnsFromManager(manager) : [],
 		};
+	}
+
+	resolveHistoryMode(value, fallback = "legacy") {
+		if (value === undefined || value === null) return fallback;
+		if (["legacy", "paginated"].includes(value)) return value;
+		throw new Error(`Unsupported history mode: ${value}`);
 	}
 
 	isAllowedModel(model) {
@@ -1372,22 +1444,9 @@ class PiDaemon {
 	}
 
 	resolveModel(modelValue, providerValue, currentProvider) {
-		if (!modelValue) return undefined;
-		let provider = providerValue || currentProvider;
-		let modelId = modelValue;
-		const separator = modelValue.indexOf("/");
-		const qualifiedProvider = separator > 0 ? modelValue.slice(0, separator) : null;
-		if (qualifiedProvider && (!providerValue || qualifiedProvider === providerValue)) {
-			provider = qualifiedProvider;
-			modelId = modelValue.slice(separator + 1);
-		}
-		let model = provider ? this.modelRuntime.getModel(provider, modelId) : undefined;
-		if (!model) {
-			const matches = this.modelRuntime.getModels().filter((candidate) => candidate.id === modelId);
-			if (matches.length === 1) model = matches[0];
-		}
-		if (!model) throw new Error(`Unknown model: ${modelValue}`);
-		if (!this.isAllowedModel(model)) throw new Error(`Model is outside the configured Pi scope: ${model.provider}/${model.id}`);
+		const model = selectModelCandidate(this.modelRuntime.getModels(), this.scopedModels, modelValue, providerValue, currentProvider);
+		if (!model && modelValue) throw new Error(`Unknown model: ${modelValue}`);
+		if (model && !this.isAllowedModel(model)) throw new Error(`Model is outside the configured Pi scope: ${model.provider}/${model.id}`);
 		return model;
 	}
 
@@ -1413,7 +1472,9 @@ class PiDaemon {
 		if (params.approvalsReviewer && params.approvalsReviewer !== "user") throw new Error("Only user approval review is supported by the Pi daemon");
 		if (params.sandboxPolicy && params.sandboxPolicy.type !== "dangerFullAccess") throw new Error("Pi sandbox policies are not supported");
 		if (params.permissions && params.permissions !== "pi-remote") throw new Error("Unknown Pi permission profile");
-		const unsupported = ["serviceTier", "summary", "collaborationMode", "personality"];
+		// Codex Mobile includes summary metadata on turn starts. Pi has no equivalent
+		// per-turn setting, but it is safe to ignore rather than reject the request.
+		const unsupported = ["serviceTier", "collaborationMode", "personality"];
 		const requested = unsupported.find((field) => params[field] !== undefined && params[field] !== null);
 		if (requested) throw new Error(`${requested} is not supported by the Pi daemon`);
 		if (params.cwd && resolve(params.cwd) !== resolve(managed.cwd)) throw new Error("Changing cwd on a loaded Pi session is not supported");
@@ -1435,6 +1496,7 @@ class PiDaemon {
 
 	async createSession(params = {}) {
 		const { cwd, ephemeral = false, model, modelProvider } = params;
+		const historyMode = this.resolveHistoryMode(params.historyMode);
 		if (params.approvalPolicy && params.approvalPolicy !== "on-request") throw new Error("Only the on-request approval policy is supported by the Pi daemon");
 		if (params.approvalsReviewer && params.approvalsReviewer !== "user") throw new Error("Only user approval review is supported by the Pi daemon");
 		if (params.sandbox && params.sandbox !== "danger-full-access" && params.sandbox.type !== "dangerFullAccess") throw new Error("Pi sandbox modes are not supported");
@@ -1442,8 +1504,9 @@ class PiDaemon {
 		const unsupported = ["runtimeWorkspaceRoots", "environments", "dynamicTools", "selectedCapabilityRoots", "baseInstructions", "developerInstructions", "serviceTier", "serviceName", "personality"];
 		const requested = unsupported.find((field) => params[field] !== undefined && params[field] !== null && (!Array.isArray(params[field]) || params[field].length));
 		if (requested) throw new Error(`${requested} is not supported by the Pi daemon`);
-		if (params.config && Object.keys(params.config).length) throw new Error("config overrides are not supported by the Pi daemon");
-		if (params.historyMode && params.historyMode !== "legacy") throw new Error("Only legacy history mode is supported by the Pi daemon");
+		// Codex Mobile includes UI/config metadata when starting a thread. Pi has
+		// no equivalent per-thread configuration, so retain the selected model and
+		// other supported top-level settings while ignoring this metadata.
 		const workingDirectory = cwd || process.cwd();
 		const selectedModel = this.resolveModel(model, modelProvider);
 		const sessionManager = ephemeral
@@ -1457,7 +1520,37 @@ class PiDaemon {
 			scopedModels: this.scopedModels,
 			sessionManager,
 		});
+		saveRemoteState(sessionManager, "historyMode", historyMode);
 		return this.registerSession(result.session, workingDirectory);
+	}
+
+	async releaseSessionForTui(sessionId, pid) {
+		this.tuiOwners.set(sessionId, pid);
+		const managed = this.sessions.get(sessionId);
+		if (!managed) {
+			console.error(`[handoff] Pi TUI pid=${pid || "unknown"} claimed unloaded thread=${sessionId}`);
+			return false;
+		}
+
+		console.error(`[handoff] Pi TUI pid=${pid || "unknown"} claimed thread=${sessionId}; releasing daemon ownership`);
+		managed.released = true;
+		const active = managed.activeTurn;
+		if (active) {
+			active.interrupted = true;
+			await managed.session.abort();
+			if (managed.activeTurn) this.finishTurn(managed, "interrupted", active.id);
+		}
+		managed.session.dispose();
+		this.sessions.delete(sessionId);
+		return true;
+	}
+
+	releaseTuiOwnership(sessionId, pid) {
+		const ownerPid = this.tuiOwners.get(sessionId);
+		if (ownerPid === undefined || ownerPid === pid) {
+			this.tuiOwners.delete(sessionId);
+			console.error(`[handoff] Pi TUI pid=${pid || "unknown"} released thread=${sessionId}`);
+		}
 	}
 
 	async loadByPath(sessionPath) {
@@ -1474,6 +1567,9 @@ class PiDaemon {
 	}
 
 	async loadById(threadId) {
+		if (this.tuiOwners.has(threadId)) {
+			throw new Error("Thread is currently controlled by a Pi TUI");
+		}
 		const existing = this.sessions.get(threadId);
 		if (existing) return existing;
 		const info = await this.infoForId(threadId);
@@ -1486,9 +1582,11 @@ class PiDaemon {
 			id: session.sessionId,
 			session,
 			cwd,
+			historyMode: remoteState(session.sessionManager).historyMode,
 			createdAt: Math.floor(Date.now() / 1000),
 			clients: new Set(),
 			activeTurn: undefined,
+			released: false,
 		};
 		this.sessions.set(managed.id, managed);
 		session.subscribe((event) => this.handlePiEvent(managed, event));
@@ -1528,7 +1626,7 @@ class PiDaemon {
 
 	async runTurn(managed, turnId, input, options) {
 		const active = managed.activeTurn;
-		if (!active || active.id !== turnId) return;
+		if (!active || active.id !== turnId || managed.released) return;
 		try {
 			const unsupported = (input || []).find((part) => part?.type !== "text" && part?.type !== "image");
 			if (unsupported) throw new Error(`Input type is not supported by the Pi daemon: ${unsupported.type || "unknown"}`);
@@ -1539,11 +1637,14 @@ class PiDaemon {
 				source: { type: "url", url: part.url },
 			}));
 			await managed.session.prompt(text, { images: images.length ? images : undefined, source: "rpc" });
+			if (managed.released) return;
 			const status = active.interrupted ? "interrupted" : "completed";
 			this.recordTurnMetadata(managed, active, status);
 			this.finishTurn(managed, status, active.id);
 		} catch (error) {
+			if (managed.released) return;
 			active.error = error instanceof Error ? error.message : String(error);
+			console.error(`[turn] thread=${managed.id} turn=${turnId} failed: ${active.error}`);
 			const status = active.interrupted ? "interrupted" : "failed";
 			this.recordTurnMetadata(managed, active, status);
 			this.finishTurn(managed, status, active.id);
@@ -1586,6 +1687,7 @@ class PiDaemon {
 	}
 
 	handlePiEvent(managed, event) {
+		if (managed.released) return;
 		const active = managed.activeTurn;
 		if (!active) return;
 		if (event.type === "message_update") {
@@ -1696,12 +1798,8 @@ class PiDaemon {
 				case "thread/resume": {
 					const managed = await this.loadById(params.threadId);
 					managed.clients.add(client);
-					const thread = this.threadFromManaged(managed, true);
-					this.sendResult(client, id, {
-						...this.threadStartResponse(managed, thread),
-						turnsBackwardsCursor: null,
-						itemsBackwardsCursor: null,
-					});
+					const thread = this.threadFromManaged(managed, !params.excludeTurns);
+					this.sendResult(client, id, this.threadStartResponse(managed, thread));
 					return;
 				}
 				case "thread/fork": {
@@ -1784,7 +1882,10 @@ class PiDaemon {
 					const managed = await this.loadById(params.threadId);
 					await this.revertBeforeTurn(managed, params.beforeTurnId);
 					const hasHistory = turnsFromManager(managed.session.sessionManager).length > 0;
-					this.sendResult(client, id, { thread: this.threadFromManaged(managed), turnsBackwardsCursor: hasHistory ? "0" : null, itemsBackwardsCursor: hasHistory ? "0" : null });
+					this.sendResult(client, id, {
+						thread: this.threadFromManaged(managed),
+						...(managed.historyMode === "paginated" ? this.paginatedCursors(managed) : { turnsBackwardsCursor: hasHistory ? "0" : null, itemsBackwardsCursor: hasHistory ? "0" : null }),
+					});
 					return;
 				}
 				case "thread/rollback": {
@@ -1792,7 +1893,10 @@ class PiDaemon {
 					const turns = turnsFromManager(managed.session.sessionManager);
 					if (!Number.isInteger(params.numTurns) || params.numTurns < 1 || params.numTurns > turns.length) throw new Error("numTurns must be between 1 and the number of turns");
 					await this.revertBeforeTurn(managed, turns[turns.length - params.numTurns].id);
-					this.sendResult(client, id, { thread: this.threadFromManaged(managed, true) });
+					this.sendResult(client, id, {
+						thread: this.threadFromManaged(managed, true),
+						...(managed.historyMode === "paginated" ? this.paginatedCursors(managed) : {}),
+					});
 					return;
 				}
 				case "turn/start": {
@@ -1979,7 +2083,9 @@ class PiDaemon {
 					this.sendError(client, id, -32601, `Method not implemented: ${method}`);
 			}
 		} catch (error) {
-			this.sendError(client, id, -32000, error instanceof Error ? error.message : String(error));
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			console.error(`[rpc] method=${method || "<response>"} failed: ${errorMessage} context=${JSON.stringify(requestLogContext(params))}`);
+			this.sendError(client, id, -32000, errorMessage);
 		}
 	}
 
@@ -1999,6 +2105,7 @@ class PiDaemon {
 			activePermissionProfile: { id: "pi-remote", extends: null },
 			reasoningEffort: effortForCodex(managed.session.thinkingLevel) || null,
 			multiAgentMode: "explicitRequestOnly",
+			...(managed.historyMode === "paginated" ? this.paginatedCursors(managed) : {}),
 		};
 	}
 
@@ -2014,6 +2121,7 @@ class PiDaemon {
 		this.sessions.clear();
 		for (const pending of this.pendingRequests.values()) pending.resolve(undefined);
 		this.pendingRequests.clear();
+		await this.tuiOwnershipBridge.stop();
 		await this.permissionBridge.stop();
 		this.remote?.stop();
 		this.websocketServer.close();
@@ -2022,39 +2130,11 @@ class PiDaemon {
 	}
 }
 
-function printHelp() {
-	console.log(`Usage:
-  pi-remote-daemon start [--remote] [--socket PATH] [--port PORT]
-  pi-remote-daemon pair [--remote-url URL] [--wait] [--re-enroll]
-  pi-remote-daemon takeover --session PATH [--pid PID] [--force]
-
-Options:
-  --socket PATH  Unix socket path (default: ${defaultSocket})
-  --port PORT    Listen on a WebSocket TCP port instead of Unix socket
-  --session PATH Session file to load or take over
-  --pid PID      Pi TUI PID to terminate
-  --force        Use SIGKILL after graceful termination times out
-  --remote       Connect this daemon to Codex Mobile's relay
-  --models PATTERNS  Comma-separated model scope (overrides enabledModels)
-  --remote-url   Codex backend URL (default: https://chatgpt.com/backend-api)
-  --wait         Log pairing status until mobile claims the code
-  --re-enroll    Refresh enrollment metadata while keeping the installation ID`);
-}
-
-const options = parseArgs(process.argv.slice(2));
-if (options.help) {
-	printHelp();
-	process.exit(0);
-}
-
 try {
+	const options = parseArgs(process.argv.slice(2));
 	if (options.command === "pair") {
 		await new RemoteControlClient(undefined, options).pair();
 		process.exit(0);
-	}
-	if (options.command === "takeover" || (options.command === "start" && options.session)) {
-		if (!options.session) throw new Error("takeover requires --session PATH");
-		await takeOver(options.session, options.pid, options.force);
 	}
 	const daemon = new PiDaemon(options);
 	let stopping = false;

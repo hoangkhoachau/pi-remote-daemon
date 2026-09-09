@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:net";
+import { createConnection, createServer, type Server } from "node:net";
 import { chmod, mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -6,10 +6,44 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const controlDir = join(agentDir, "app-server", "session-control");
+const daemonControlPath = join(agentDir, "app-server", "daemon-control.sock");
+
+type DaemonControlResponse = { ok?: boolean };
+
+function notifyDaemon(command: "claim" | "release", sessionId: string): Promise<DaemonControlResponse | undefined> {
+	return new Promise((resolve) => {
+		const connection = createConnection(daemonControlPath);
+		let buffer = "";
+		let settled = false;
+		const finish = (response?: DaemonControlResponse) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			connection.destroy();
+			resolve(response);
+		};
+		const timeout = setTimeout(() => finish(), 15_000);
+		connection.once("connect", () => {
+			connection.write(`${JSON.stringify({ command, sessionId, pid: process.pid })}\n`);
+		});
+		connection.on("data", (chunk) => {
+			buffer += chunk;
+			const newline = buffer.indexOf("\n");
+			if (newline < 0) return;
+			try {
+				finish(JSON.parse(buffer.slice(0, newline)) as DaemonControlResponse);
+			} catch {
+				finish();
+			}
+		});
+		connection.once("error", () => finish());
+	});
+}
 
 export default function piRemoteBridge(pi: ExtensionAPI) {
 	let server: Server | undefined;
 	let socketPath: string | undefined;
+	let claimedSessionId: string | undefined;
 
 	async function closeControl(): Promise<void> {
 		const currentServer = server;
@@ -64,9 +98,15 @@ export default function piRemoteBridge(pi: ExtensionAPI) {
 			server?.listen(socketPath, resolve);
 		});
 		await chmod(socketPath, 0o600);
+		claimedSessionId = sessionId;
+		await notifyDaemon("claim", sessionId);
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (claimedSessionId) {
+			await notifyDaemon("release", claimedSessionId);
+			claimedSessionId = undefined;
+		}
 		await closeControl();
 	});
 }

@@ -12,7 +12,7 @@ npm install
 
 The repository launcher is `bin/pi-remote-daemon`. Add it to your `PATH` or link it from a directory already in your `PATH`.
 
-For graceful takeover of an active Pi TUI session, install the optional bridge extension:
+For graceful daemon/TUI session handoff, install the optional bridge extension:
 
 ```sh
 mkdir -p ~/.pi/agent/extensions
@@ -23,46 +23,21 @@ Restart Pi or run `/reload` after installing the extension.
 
 ## Run
 
-Start on a Unix socket:
+There are only two commands:
 
 ```sh
+# Prints a code and waits for Codex Mobile to claim it.
+pi-remote-daemon pair
+
+# Starts the daemon and connects it to Codex Mobile.
 pi-remote-daemon start
 ```
 
-The model selector mirrors Pi's `enabledModels` scope from `~/.pi/agent/settings.json`, and model-change requests outside that scope are rejected. Override it for a daemon with `--models`:
+`pair` reads the ChatGPT login from `~/.codex/auth.json`, enrolls this daemon, and prints a pairing code. Enter it in Codex Mobile; the command confirms when pairing completes.
 
-```sh
-pi-remote-daemon start --models 'openai-codex/gpt-5.6-*,anthropic/claude-sonnet-5'
-```
+The daemon listens on its standard Unix socket at `~/.pi/agent/app-server/control.sock`. Its model list follows `enabledModels` in `~/.pi/agent/settings.json`.
 
-Enable Codex Mobile remote control:
-
-```sh
-pi-remote-daemon pair --wait
-pi-remote-daemon start --remote
-```
-
-`pair` reads the ChatGPT login from `~/.codex/auth.json`, enrolls this daemon, and prints a pairing code. Enter that code in the Codex mobile app. With `--wait`, it logs `claimed=false` until the app accepts the code, then logs `pairing completed`.
-
-Start on a WebSocket TCP port:
-
-```sh
-pi-remote-daemon start --port 4318
-```
-
-Take over an existing Pi session:
-
-```sh
-pi-remote-daemon takeover --session ~/.pi/agent/sessions/.../session.jsonl
-```
-
-The optional `pi-remote-bridge.ts` extension exposes a per-session Unix socket. When present, the daemon asks Pi to shut down through `ctx.shutdown()`, so Pi waits for idle, cleans up the TUI, and prints its own resume command before the daemon opens the JSONL session. Without the bridge, pass `--pid` for a direct SIGTERM takeover.
-
-```text
-To resume this session: pi --session '/path/to/session.jsonl'
-```
-
-Use `--pid` when process discovery cannot identify the TUI (an idle Pi may not have its JSONL file open). Use `--force` only when a graceful SIGTERM does not stop it.
+The optional `pi-remote-bridge.ts` extension makes handoff safe when a Pi TUI and the daemon resume the same session. It is not required for basic pairing and remote control.
 
 ## Supported protocol methods
 
@@ -78,6 +53,7 @@ Use `--pid` when process discovery cannot identify the TUI (an idle Pi may not h
 - `thread/search`
 - `thread/searchOccurrences`
 - `thread/turns/list` and `thread/items/list` with cursors
+- Paginated history mode: persisted as Pi session metadata; start/resume responses omit inline turns and provide cursors
 - `thread/loaded/list`
 - `thread/unsubscribe`
 - `thread/goal/get`, `thread/goal/set`, `thread/goal/clear`

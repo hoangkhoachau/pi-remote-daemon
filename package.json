@@ -8,7 +8,7 @@
     "pi-remote-daemon": "bin/pi-remote-daemon"
   },
   "scripts": {
-    "start": "node src/main.mjs",
+    "start": "node src/main.mjs start",
     "check": "node --check src/main.mjs && node --check test/protocol.test.mjs",
     "test": "node --test test/*.test.mjs"
   },
